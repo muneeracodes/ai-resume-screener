@@ -66,10 +66,88 @@ EXPECTED_SCHEMA = {
     "score_rationale": str,
     "missing_keywords": list,
     "strengths": list,
-    "weak_sections": list,   # each item: {original, rewrite, reason}
+    "weak_sections": list,
     "recommendation": str,
 }
 
+def clean_and_heal_data(data: dict) -> dict:
+    """
+    Normalizes and heals common LLM generation variance so that
+    it is guaranteed to match the exact frontend typescript structures.
+    """
+    # 1. Self-healing key maps for similar semantic expressions
+    mappings = {
+        "justification": "score_rationale",
+        "rationale": "score_rationale",
+        "missing_skills": "missing_keywords",
+        "keyword_gaps": "missing_keywords",
+        "aligned_strengths": "strengths",
+        "found_keywords": "strengths",
+        "recommended_rewrites": "weak_sections"
+    }
+    
+    for old_key, new_key in mappings.items():
+        if old_key in data and new_key not in data:
+            data[new_key] = data[old_key]
+
+    # Ensure all baseline keys are initialized with safe default types if completely absent
+    if "match_score" not in data:
+        data["match_score"] = 0
+    else:
+        # Cast match_score to integer if returned as a string or float
+        try:
+            data["match_score"] = int(float(data["match_score"]))
+        except (ValueError, TypeError):
+            data["match_score"] = 0
+
+    if "score_rationale" not in data or not isinstance(data["score_rationale"], str):
+        data["score_rationale"] = "No rationale provided."
+
+    if "missing_keywords" not in data or not isinstance(data["missing_keywords"], list):
+        data["missing_keywords"] = []
+
+    if "strengths" not in data or not isinstance(data["strengths"], list):
+        data["strengths"] = []
+
+    if "weak_sections" not in data or not isinstance(data["weak_sections"], list):
+        data["weak_sections"] = []
+
+    # Parse and structural check elements in weak_sections
+    healed_sections = []
+    for section in data["weak_sections"]:
+        if isinstance(section, dict):
+            # Repair nested keys inside weak_sections
+            original = str(section.get("original", section.get("current_text", "Section improvement needed.")))
+            rewrite = str(section.get("rewrite", section.get("suggested_rewrite", "")))
+            reason = str(section.get("reason", section.get("explanation", "Needs optimization.")))
+            healed_sections.append({
+                "original": original,
+                "rewrite": rewrite,
+                "reason": reason
+            })
+    data["weak_sections"] = healed_sections
+
+    if "recommendation" not in data:
+        # Generate dynamically if missing based on match_score
+        score = data["match_score"]
+        if score >= 80:
+            data["recommendation"] = "strong_match"
+        elif score >= 50:
+            data["recommendation"] = "moderate_match"
+        elif score >= 25:
+            data["recommendation"] = "weak_match"
+        else:
+            data["recommendation"] = "no_match"
+            
+    # Normalize recommendation string syntax
+    rec = str(data["recommendation"]).lower().replace(" ", "_")
+    valid_recs = ["strong_match", "moderate_match", "weak_match", "no_match"]
+    if rec not in valid_recs:
+        data["recommendation"] = "moderate_match"
+    else:
+        data["recommendation"] = rec
+
+    return data
 def validate_schema(data: dict) -> tuple[bool, str]:
     """Check every required key exists and has the right type."""
     for key, expected_type in EXPECTED_SCHEMA.items():
@@ -139,6 +217,7 @@ JOB DESCRIPTION:
                 data = extract_json_from_text(raw)
                 if data is None:
                     raise ValueError("Could not parse JSON from response")
+                data = clean_and_heal_data(data)
 
                 valid, err = validate_schema(data)
                 if not valid:
@@ -283,6 +362,32 @@ def analyze_stream():
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            # ─── ADD THESE TWO LINES FOR CORS STREAM SECURITY ───
+            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+    """Single resume analysis — streams tokens via SSE."""
+    if "resume" not in request.files:
+        return jsonify({"error": "No resume file uploaded"}), 400
+
+    job_description = request.form.get("job_description", "").strip()
+    if not job_description:
+        return jsonify({"error": "Job description is required"}), 400
+
+    file = request.files["resume"]
+    file_bytes = file.read()
+    resume_text, is_scanned = extract_pdf_text(file_bytes)
+
+    if is_scanned:
+        return jsonify({"error": "scanned_pdf"}), 422
+
+    return Response(
+        stream_with_context(stream_analysis(resume_text, job_description)),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -340,4 +445,4 @@ def batch_analyze():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=8000)
